@@ -5,6 +5,8 @@ Reference article 参考文章：
 >跑通宇树G1的 sim2sim
 >[https://blog.csdn.net/shanpenghui/article/details/109361766](https://blog.csdn.net/shanpenghui/article/details/150413803?spm=1001.2014.3001.5502)
 
+本机已配置的 Python 3.8 / PyTorch CUDA 12.1 环境，使用方法见 [本机配置说明](SETUP_zh.md)。
+
 ## 安装配置
 
 ## 1. 创建虚拟环境
