@@ -1,0 +1,22 @@
+{
+  "source": "/home/luohaoyu/G1-Perceptive-Sim2Sim/g1_23dof/rough_terrain_cfg.py",
+  "sha256": "9317e909976ce035225e0c975fb7bc30d610b171601ad04c2d2308303c2a2aa7",
+  "ground_z": -0.05,
+  "planks": {
+    "name": "wooden_planks",
+    "start": [
+      2.0,
+      0.0,
+      0.0
+    ],
+    "num_planks": 16,
+    "plank_width": 0.6,
+    "plank_length": 0.9,
+    "thickness": 0.05,
+    "min_gap": 0.2,
+    "max_gap": 0.2,
+    "seed": 23,
+    "approach_length": 4.0,
+    "landing_length": 2.0
+  }
+}

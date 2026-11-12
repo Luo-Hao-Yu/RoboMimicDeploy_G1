@@ -1,4 +1,49 @@
-本机已配置的 Python 3.8 / PyTorch CUDA 12.1 环境，使用方法见 [本机配置说明](SETUP_zh.md)。
+# G1 23DoF Parkour 仿真
+
+默认入口现已复用 `~/deploy_mujoco` 的 23DoF Parkour 部署流程，使用相同的
+机器人、ONNX 策略、深度相机与木板地形，资源均已拷贝到本项目。
+
+```bash
+source .venv-parkour/bin/activate
+python deploy_mujoco/deploy_mujoco.py
+```
+
+等价于在源项目运行：
+
+```bash
+python deploy_mujoco.py --config config/g1_23dof/parkour/params/deploy.yaml
+```
+
+- 启动后机器人直接由 Parkour 策略站立，双摇杆回中后启用控制，无需 Start、LB+X 或 RB+A。
+- 左摇杆上推：前进，范围 0～0.65 m/s；松开归零。该策略不启用后退与横移。
+- 右摇杆左右：转向，范围 ±1 rad/s；松开归零。
+- 关闭 MuJoCo 窗口或按窗口内的 Esc 退出；旧版舞蹈/起身组合键不适用于该入口。
+- 默认显示深度预览，运行时长 600 秒；配置位于 `config/g1_23dof/parkour/params/deploy.yaml`。
+
+可选参数示例：
+
+```bash
+python deploy_mujoco/deploy_mujoco.py --simulation-duration 10
+python deploy_mujoco/deploy_mujoco.py --control keyboard
+python deploy_mujoco/deploy_mujoco.py --gamepad-device /dev/input/js1
+```
+
+键盘模式下，小键盘 6/4 增减前进速度，9/3 增减转向速度，5 清零。
+运行环境与验证命令见 [SETUP_zh.md](SETUP_zh.md)，代码来源见
+[复用说明](deploy_mujoco/UPSTREAM.md)。
+
+## 原 29DoF 模式
+
+原先的 29DoF FSM、舞蹈和起身流程保留在独立入口：
+
+```bash
+source .venv/bin/activate
+python deploy_mujoco/deploy_mujoco_29dof.py
+```
+
+下方原有说明中的按键、模式及真机部署均针对原 29DoF 程序。
+
+原 29DoF 的 Python 3.8 / PyTorch CUDA 12.1 环境保存在 `.venv`。
 
 ## 安装配置
 
@@ -54,7 +99,7 @@ pip install -e .
 ## 1. 运行Mujoco仿真代码
 
 ```bash
-python deploy_mujoco/deploy_mujoco.py
+python deploy_mujoco/deploy_mujoco_29dof.py
 ```
 
 ## 2. Policy 说明
@@ -80,13 +125,13 @@ python deploy_mujoco/deploy_mujoco.py
 2. 运行仿真程序：
 
 ```bash
-python deploy_mujoco/deploy_mujoco.py
+python deploy_mujoco/deploy_mujoco_29dof.py
 ```
 
 如果需要机器人从平躺状态站立，进入 LocoMode ，则运行以下指令
 
 ```
-python deploy_mujoco/deploy_mujoco.py xml_path=g1_description/g1_29dof_LieDown.xml
+python deploy_mujoco/deploy_mujoco_29dof.py xml_path=g1_description/g1_29dof_LieDown.xml
 ```
 
 3. Start键进入位控模式

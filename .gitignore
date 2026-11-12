@@ -1,6 +1,8 @@
 .venv/
+.venv-parkour/
 .deps/
 __pycache__/
 *.py[cod]
 outputs/
 multirun/
+logs/
