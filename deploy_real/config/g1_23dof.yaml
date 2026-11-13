@@ -6,15 +6,15 @@ lowcmd_topic: rt/lowcmd
 lowstate_topic: rt/lowstate
 # Verify the physical robot revision before enabling motor commands.
 expected_mode_machine: 4
-# No XY estimator is currently installed. Preserve direct remote commands.
+# Heading feedback uses the existing LowState pelvis IMU; no XY file required.
 path_control:
-  enabled: false
-  mode: path
-  # Applied once localization is available and path control is enabled.
+  enabled: true
+  mode: heading
+  # Capture yaw when starting straight or releasing a manual turn.
   reference: current
   origin_xy: [0.0, 0.0]
   yaw_rad: 0.0
-  frame_id: start_local
+  frame_id: lowstate_imu
   heading_gain: 2.0
   lookahead_m: 1.0
   # Keep existing real limits; these are not the validated sim baseline.
@@ -24,9 +24,6 @@ path_control:
   max_state_skew_s: 0.05
   min_confidence: 0.8
   manual_rebase: false
-  pose_source:
-    type: json_file
-    path: /tmp/g1_pelvis_pose.json
 camera:
   source: ssh
   ssh_host: unitree@192.168.123.164
@@ -53,7 +50,8 @@ control:
   ready_max_joint_velocity_rad_s: 0.2
   ready_max_gyro_rad_s: 0.2
   ready_hold_s: 0.5
-  ready_timeout_s: 3.0
+  # Allow transient settling motion to subside; still require continuous qualification.
+  ready_timeout_s: 8.0
   policy_blend_s: 1.0
   damping_kd: 2.0
   damping_duration_s: 1.0
@@ -62,6 +60,14 @@ control:
   max_abs_action: 20.0
   max_target_step_rad_s: 6.0
   max_position_error_rad: 0.8
+  # Bounded recovery in POLICY only; transmitted error stays <= 0.8 rad.
+  # Initial engineering limits, not validated physical recovery guarantees.
+  tracking_recovery:
+    enabled: true
+    hard_error_rad: 1.0
+    release_error_rad: 0.65
+    timeout_s: 0.5
+    release_hold_s: 0.1
   joystick_deadzone: 0.12
   max_forward_m_s: 0.3
   max_yaw_rad_s: 0.5

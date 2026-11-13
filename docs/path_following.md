@@ -34,10 +34,54 @@ G1 23 自由度机器人的 MuJoCo 仿真部署和实机部署共用 `common/pat
 对于已知的平台中心线，使用 `reference: fixed` 和 `manual_rebase: false`，并在与位姿相同的坐标系中定义平台中心线。使用自定义 XML 时，需要核对该路径定义。
 当前朝向参考模式沿操作者选择的方向行走，不保证与平台中心线对齐，也不会自动沿去程轨迹原路返回。
 
-## 实机定位接口
+## 实机内部 IMU 朝向纠偏
 
-`deploy_real/config/g1_23dof.yaml` 默认设置为 `path_control.enabled: false`。
-目前尚未安装 XY 位置估计器，因此实机部署保留手柄直接速度指令。现有实机速度限制（0.3 m/s、0.5 rad/s）保持不变；这些限制不能作为仿真中 0.4 m/s 基线已通过实机验证的依据。
+`deploy_real/config/g1_23dof.yaml` 现在默认启用基于内部 IMU 的朝向纠偏：
+
+```yaml
+path_control:
+  enabled: true
+  mode: heading
+  reference: current
+  frame_id: lowstate_imu
+  heading_gain: 2.0
+  max_forward_m_s: 0.3
+  max_yaw_rad_s: 0.5
+  state_timeout_s: 0.1
+```
+
+朝向直接来自已经订阅的 `LowState.imu_state.quaternion`，四元数顺序为 wxyz，使用与策略观测一致的 pelvis 姿态。
+无需 `/tmp/g1_pelvis_pose.json` 或任何外部定位文件，也不对原始加速度进行位置积分。
+开始直行时记录当前 yaw；持续直行时按下式纠正朝向：
+
+```text
+wz = clip(2.0 * wrap(yaw_reference - yaw_current), -0.5, 0.5)
+```
+
+手动转向时优先使用右摇杆指令，松开转向并继续前进时记录新的 yaw；停止时输出严格零速度指令，重新前进时采集新的朝向参考。
+前进速度保持操作者请求值并受 0.3 m/s 上限约束，vy 恒为零。IMU 四元数无效、数据过期或时间戳倒退时，现有推理故障和上层保护流程会处理故障。
+日志中的 `state_source` 为 `lowstate_imu`，`heading_error_rad` 表示朝向误差；`cross_track_m` 和 `origin_xy` 为 `null`，表示没有位置测量，不能解释为横向偏差为零。
+
+该功能抑制朝向转偏引起的跑偏，但不能检测朝向不变时的纯横向漂移，长期效果也受 IMU 航向漂移影响。现有实机速度限制不是仿真中 0.4 m/s 基线已通过实机验证的依据。
+`enabled: true` 只启用指令纠偏，不自动启用电机输出；部署程序仍默认只读，控制权交接仍需原有 `--enable` 和 Start/A 流程。
+要恢复手柄直接速度控制，可将 `enabled` 改为 `false`。仿真默认仍为 `path`；对照 IMU 朝向保持算法可运行：
+
+```bash
+.venv-parkour/bin/python deploy_mujoco/deploy_mujoco.py --path-mode heading --path-reference current
+```
+
+## 可选的外部定位路径纠偏
+
+只有使用 `mode: path` 进行横向位置反馈时，才要求真实的 XY 定位。当前默认实机配置没有 `pose_source`；直接切换到 `path` 会因缺少定位源而拒绝启动。
+今后有定位设备时，可同时设置 `mode: path`、匹配估计器的 `frame_id`，并添加：
+
+```yaml
+pose_source:
+  type: json_file
+  path: /tmp/g1_pelvis_pose.json
+```
+
+以上 `pose_source` 应放在 `path_control` 节点内。
 
 接入定位时，估计器应以原子替换方式更新 `pose_source.path` 指定的 JSON 文件，即先写临时文件，再调用 `os.replace`。数据格式如下：
 
@@ -57,8 +101,7 @@ G1 23 自由度机器人的 MuJoCo 仿真部署和实机部署共用 `common/pat
 XY 和 yaw 必须描述同一固定坐标系中的 pelvis 位姿，约定 +X 向前、+Y 向左、yaw 逆时针为正。
 估计器负责 IMU、pelvis、相机之间的标定以及时间对齐；未经坐标变换，不要把局部 IMU 的 yaw 与世界坐标系的 XY 混用。样本更新频率至少为 50 Hz。
 
-实机配置也选择 `reference: current`，但在具备定位能力之前，反馈保持关闭。
-启用前，应将坐标系 ID 配置为与估计器一致。使用 `reference: fixed` 时，还需要设置中心线原点和 yaw。
+以下检查针对外部定位的 `path` 模式。启用前，应将坐标系 ID 配置为与估计器一致。使用 `reference: fixed` 时，还需要设置中心线原点和 yaw。
 置信度过低、位置缺失或无效、位姿数据年龄超过 0.1 s，或位姿与 LowState 的时间差超过 0.05 s，都会触发推理故障，并由现有上层控制流程处理。
 程序不会默默使用过期 XY，也不会根据原始 IMU 加速度虚构位置。
 如果估计器重置坐标系，应停止部署，变换或重新配置路线后再启动；时间戳倒退或坐标系 ID 变化会被拒绝。
@@ -113,3 +156,8 @@ P95 使用预热结束再经过 1 s 后的真值数据计算。这些结果不�
 新参考线从松开转向输入时的位置开始，因此这不是沿去程轨迹自动原路返回。该结果仅来自一次仿真运行，没有输出实机电机指令。
 
 报告和复现脚本分别为 `current-heading-turnaround.json` 和 `validate_current_heading_turnaround.py`，均保存在 `logs/g1_23dof/path_feedback/` 中。
+
+## 内部 IMU 纠偏的离线验证
+
+接入 IMU 朝向反馈后，全部 71 项测试通过。新增检查覆盖无需定位文件的默认启动、参考保持、角度跨越正负 pi、转向与停止、策略重置、指令限幅、无效及过期姿态，以及实际推理线程中纠偏指令进入观测历史的顺序。
+只读模式、控制权交接和原有路径定位故障测试也通过。测试使用合成状态和模拟传输，未连接机器人、未发送真实电机指令；前述仿真路径反馈数据不能作为本次 IMU 实机纠偏效果的测量值。

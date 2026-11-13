@@ -28,7 +28,8 @@ class TrackingDiagnosticsTests(TestCase):
 
     def test_fault_names_hardware_slot_and_rejects_candidate(self):
         # left shoulder yaw is compact 15, HG slot 17, policy index 13.
-        c=Controller(self.policy,self.cfg['control'])
+        strict = dict(self.cfg['control'], tracking_recovery=dict(enabled=False))
+        c=Controller(self.policy,strict)
         c.phase=Phase.POLICY
         c.generation=1
         c.phase_start_ns=1_000_000_000
@@ -88,6 +89,8 @@ class TrackingDiagnosticsTests(TestCase):
             self.assertEqual(result['status'],'FAIL')
             self.assertEqual(result['error'],'injected inference failure')
             self.assertEqual(result['phase_at_failure'],'waiting')
+            self.assertIsInstance(result['failure_monotonic_ns'],int)
+            self.assertNotIn('shutdown',result)
             self.assertEqual(result['cleanup_errors'],['test cleanup failure'])
         self.assertEqual(events,['worker closed','camera close attempted','transport closed'])
 
@@ -100,7 +103,8 @@ class TrackingDiagnosticsTests(TestCase):
         raw,target=p.step(state,command,np.ones((36,64),np.float32))
         action=ActionSample(target.copy(),raw.copy(),3_000_000_000,3_000_000_000,3_000_000_000,1,
                             command=command,proprio=p.last_proprio,depth_history=p.last_depth)
-        c=Controller(p,self.cfg['control']);c.phase=Phase.POLICY;c.generation=1
+        strict = dict(self.cfg['control'], tracking_recovery=dict(enabled=False))
+        c=Controller(p,strict);c.phase=Phase.POLICY;c.generation=1
         c.phase_start_ns=1_000_000_000;c.last_time_ns=2_995_000_000
         c.last_target=np.clip(target,p.position_limits[:,0],p.position_limits[:,1])
         q=c.last_target.copy();q[15]-=1.0
@@ -112,3 +116,58 @@ class TrackingDiagnosticsTests(TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path=Path(directory)/'fault.json';path.write_text(json.dumps(report))
             inspect_report(path)
+
+    def test_fault_shutdown_records_feedback_after_rejecting_policy_output(self):
+        from deploy_real.deploy_real import run
+        from deploy_real.control import START
+        cfg=load_config();cfg['control']['damping_duration_s']=.025
+        template=self.state()
+        created=[]
+        class Transport:
+            def __init__(inner,*args,**kwargs):
+                inner.lock=threading.Lock();inner.latest=None;inner.calls=0
+                inner.damping=0;inner.released=False;created.append(inner)
+            def snapshot(inner):
+                inner.calls+=1
+                inner.latest=replace(template,received_at_ns=time.monotonic_ns(),
+                                     buttons=START if inner.calls>=3 else 0)
+                return inner.latest
+            def release_control(inner):inner.released=True
+            def send(inner,*args,**kwargs):raise AssertionError('Rejected output was sent')
+            def send_damping(inner,kd,mode_machine):
+                self.assertEqual(kd,cfg['control']['damping_kd'])
+                self.assertEqual(mode_machine,4)
+                inner.damping+=1
+            def close(inner):pass
+        class Camera:
+            def read(inner):return time.monotonic_ns(),np.ones((36,64),np.float32)
+            def close(inner):pass
+        class Worker:
+            def __init__(inner,*args):inner.thread=mock.Mock()
+            def request(inner,*args):pass
+            def snapshot(inner):
+                now=time.monotonic_ns()
+                return ActionSample(template.q.copy(),np.zeros(23),now,now,now,0),1
+            def statistics(inner):return {'policy_steps':1}
+            def close(inner):pass
+        def fail_after_takeover(controller,*args):
+            if controller.phase==Phase.WAITING:return None
+            raise ValueError('injected tracking fault')
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch('deploy_real.deploy_real.ROOT',Path(directory)), \
+             mock.patch('deploy_real.unitree_transport.UnitreeTransport',Transport), \
+             mock.patch('deploy_real.deploy_real.create_depth_source',return_value=Camera()), \
+             mock.patch('deploy_real.deploy_real.InferenceWorker',Worker), \
+             mock.patch.object(Controller,'output',autospec=True,side_effect=fail_after_takeover):
+            with self.assertRaisesRegex(ValueError,'injected tracking fault'):
+                run(cfg,self.policy,True,.1)
+            report=json.loads(next(Path(directory).glob('logs/sim2real/real_failure_*.json')).read_text())
+        self.assertTrue(created[0].released)
+        shutdown=report['shutdown']
+        self.assertGreater(shutdown['successful_sends'],0)
+        self.assertEqual(shutdown['successful_sends'],created[0].damping)
+        self.assertEqual(shutdown['send_attempts'],created[0].damping)
+        self.assertGreaterEqual(shutdown['start_monotonic_ns'],report['failure_monotonic_ns'])
+        self.assertGreater(shutdown['end_monotonic_ns'],shutdown['start_monotonic_ns'])
+        self.assertEqual(shutdown['feedback'][0]['quaternion_wxyz'],template.quaternion_wxyz.tolist())
+        self.assertEqual(shutdown['stop_reason'],'interval_complete')

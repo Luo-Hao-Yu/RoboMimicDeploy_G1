@@ -22,7 +22,7 @@ def yaw_wxyz(quaternion):
 @dataclass(frozen=True)
 class PoseSample:
     timestamp_s: float
-    xy: tuple[float, float]
+    xy: tuple[float, float] | None
     yaw: float
     frame_id: str = 'local'
     valid: bool = True
@@ -102,12 +102,15 @@ class PathController:
 
     def _check_pose(self, pose, now):
         if pose is None:
-            raise PoseUnavailableError('Path following requires a valid pelvis XY/yaw pose')
+            raise PoseUnavailableError('Feedback requires a valid pelvis orientation sample')
         if (not pose.valid or not math.isfinite(pose.confidence) or
                 not self.cfg.min_confidence <= pose.confidence <= 1 or
-                np.asarray(pose.xy).shape != (2,) or
-                not np.isfinite([pose.timestamp_s, *pose.xy, pose.yaw]).all()):
+                not np.isfinite([pose.timestamp_s, pose.yaw]).all()):
             raise PoseUnavailableError('Invalid or low-confidence path pose')
+        if self.cfg.mode == 'path' and pose.xy is None:
+            raise PoseUnavailableError('Path mode requires pelvis XY; IMU heading alone is insufficient')
+        if pose.xy is not None and (np.asarray(pose.xy).shape != (2,) or not np.isfinite(pose.xy).all()):
+            raise PoseUnavailableError('Invalid pelvis XY')
         if pose.frame_id != self.cfg.frame_id:
             raise PoseUnavailableError('Pose frame changed: transform the path and explicitly reset')
         if not -1e-6 <= now - pose.timestamp_s <= self.cfg.state_timeout_s:
@@ -117,9 +120,12 @@ class PathController:
         self.last_pose_s = pose.timestamp_s
 
     def _anchor_if_needed(self, pose):
-        if self.origin is None:
-            self.origin = np.array(pose.xy, dtype=float)
-            self.path_yaw = pose.yaw
+        if self.path_yaw is None:
+            self._set_reference(pose)
+
+    def _set_reference(self, pose):
+        self.origin = None if pose.xy is None else np.array(pose.xy, dtype=float)
+        self.path_yaw = pose.yaw
 
     def update(self, now_s, pose, requested):
         requested = np.asarray(requested, dtype=float)
@@ -149,10 +155,10 @@ class PathController:
         # heading and cross-track feedback would lose their reference.
         if (self.cfg.reference == 'current' and manual_wz == 0 and
                 self.state != PathState.PATH_FOLLOW):
-            self.origin = np.asarray(pose.xy, dtype=float).copy()
-            self.path_yaw = pose.yaw
+            self._set_reference(pose)
         normal = np.array([-math.sin(self.path_yaw), math.cos(self.path_yaw)])
-        cross_track = float(normal @ (np.asarray(pose.xy) - self.origin))
+        cross_track = (float(normal @ (np.asarray(pose.xy) - self.origin))
+                       if pose.xy is not None and self.origin is not None else None)
         desired = self.path_yaw
         saturated = False
         if manual_wz != 0:
@@ -161,9 +167,8 @@ class PathController:
             wz = manual_wz
         else:
             if self.pending_rebase and self.cfg.manual_rebase:
-                self.origin = np.asarray(pose.xy, dtype=float).copy()
-                self.path_yaw = pose.yaw
-                cross_track = 0.
+                self._set_reference(pose)
+                cross_track = 0. if pose.xy is not None else None
                 desired = self.path_yaw
             self.pending_rebase = False
             self.state = PathState.PATH_FOLLOW
@@ -177,7 +182,9 @@ class PathController:
         command = np.array([vx, 0., wz], np.float32)
         self.diagnostics.update(state=self.state.value, cross_track_m=cross_track,
                                 desired_yaw_rad=wrap_angle(desired), yaw_rad=pose.yaw,
+                                heading_error_rad=wrap_angle(desired-pose.yaw), mode=self.cfg.mode,
                                 pose_age_s=max(0., now_s-pose.timestamp_s),
-                                origin_xy=self.origin.tolist(), path_yaw_rad=self.path_yaw,
+                                origin_xy=self.origin.tolist() if self.origin is not None else None,
+                                path_yaw_rad=self.path_yaw,
                                 saturated=saturated, command=command.tolist())
         return command

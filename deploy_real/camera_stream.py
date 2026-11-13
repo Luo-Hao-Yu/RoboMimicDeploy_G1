@@ -32,6 +32,39 @@ def write_frame(output, number, stamp_ns, pixels):
     output.flush()
 
 
+class CameraProfileError(RuntimeError):
+    """Requested stream is absent from this device's current USB profile set."""
+
+
+def check_depth_profile(rs, settings):
+    devices = list(rs.context().query_devices())
+    serial = settings.get('serial')
+    matching = [d for d in devices if not serial or
+                (d.supports(rs.camera_info.serial_number) and
+                 d.get_info(rs.camera_info.serial_number) == serial)]
+    if len(matching) != 1:
+        raise RuntimeError(f'Expected one RealSense for serial={serial!r}; found {len(matching)}')
+    device = matching[0]
+    usb = (device.get_info(rs.camera_info.usb_type_descriptor)
+           if device.supports(rs.camera_info.usb_type_descriptor) else 'unknown')
+    profiles = set()
+    for sensor in device.query_sensors():
+        for profile in sensor.get_stream_profiles():
+            if profile.stream_type() == rs.stream.depth and profile.format() == rs.format.z16:
+                video = profile.as_video_stream_profile()
+                profiles.add((video.width(), video.height(), video.fps()))
+    requested = tuple(int(settings[k]) for k in ('width', 'height', 'fps'))
+    if requested not in profiles:
+        same_size = sorted(fps for w,h,fps in profiles if (w,h) == requested[:2])
+        raise CameraProfileError(
+            f'RealSense serial={serial}, USB={usb}: requested depth Z16 '
+            f'{requested[0]}x{requested[1]}@{requested[2]} is not advertised. '
+            f'FPS at this resolution: {same_size}. Check camera USB cable/port/link; '
+            'profile availability does not guarantee actual frames.'
+        )
+    return usb
+
+
 def serve(settings, requests, output):
     pipeline = None
     stopped = threading.Event()
@@ -46,6 +79,7 @@ def serve(settings, requests, output):
         width, height, fps = (int(settings[k]) for k in ('width', 'height', 'fps'))
         if not 0 < width * height <= MAX_PIXELS or min(width, height, fps) <= 0 or fps > 90:
             raise ValueError('Unsupported camera stream dimensions/rate')
+        usb = check_depth_profile(rs, settings)
         pipeline = rs.pipeline()
         config = rs.config()
         if settings.get('serial'):
@@ -58,7 +92,7 @@ def serve(settings, requests, output):
             raise ValueError('RealSense depth must be rectified')
         calibration = dict(protocol='G1_DEPTH_1', width=intrinsic.width, height=intrinsic.height,
                            fx=intrinsic.fx, fy=intrinsic.fy, ppx=intrinsic.ppx, ppy=intrinsic.ppy,
-                           scale=scale, format='z16', rectified=True)
+                           scale=scale, format='z16', rectified=True, usb_type=usb, fps=fps)
         def capture():
             previous = None
             try:
@@ -96,7 +130,9 @@ def serve(settings, requests, output):
         failure = exc
         if not calibration_sent and isinstance(exc, Exception):
             message = str(exc)
-            kind = 'device_busy' if ('device or resource busy' in message.lower() or getattr(exc, 'errno', None) == 16) else 'camera_startup'
+            kind = ('unsupported_profile' if isinstance(exc, CameraProfileError) else
+                    'device_busy' if ('device or resource busy' in message.lower() or getattr(exc, 'errno', None) == 16)
+                    else 'camera_startup')
             # Reuse the length-prefixed startup JSON; never insert it into frame data.
             # Bound escaping expansion so the client's 4096-byte handshake limit holds.
             try:

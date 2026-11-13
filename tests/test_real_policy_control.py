@@ -156,6 +156,14 @@ class RealPolicyTests(unittest.TestCase):
              patch('deploy_real.unitree_transport.UnitreeTransport',Transport), \
              patch('deploy_real.deploy_real.create_depth_source',return_value=Camera()):
             run(cfg,self.policy,True,.25)
+            reports=list(Path(directory).glob('logs/sim2real/real_session_*.json'))
+            import json
+            saved=json.loads(reports[0].read_text())
+            self.assertEqual(saved['shutdown']['kind'],'damping_only')
+            self.assertEqual(saved['shutdown']['kp'],0.)
+            self.assertGreater(saved['shutdown']['successful_sends'],0)
+            self.assertGreater(len(saved['shutdown']['feedback']),0)
+            self.assertEqual(saved['shutdown']['stop_reason'],'interval_complete')
         transport=created[0]
         self.assertTrue(transport.released)
         self.assertGreater(len(transport.commands),10)
@@ -225,7 +233,7 @@ class RealPolicyTests(unittest.TestCase):
                 return PoseSample(time.monotonic(), (0, .2), 0)
         source = Source()
         cfg = load_config()
-        cfg['path_control'].update(enabled=True, frame_id='local', reference='fixed')
+        cfg['path_control'].update(enabled=True, mode='path', frame_id='local', reference='fixed')
         adapter = RealPathControl(cfg['path_control'], cfg['control'], source)
         with patch('deploy_real.deploy_real.RealPathControl', return_value=adapter):
             worker = InferenceWorker(self.policy, Transport(), Camera(), cfg)

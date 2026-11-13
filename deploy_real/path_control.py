@@ -1,10 +1,10 @@
-"""External localization input. No position is synthesized from IMU acceleration."""
+"""LowState IMU heading or external XY localization; no acceleration integration."""
 from __future__ import annotations
 
 import json
 from pathlib import Path
 import time
-from common.path_controller import PathController, PathSettings, PoseSample, PoseUnavailableError
+from common.path_controller import PathController, PathSettings, PoseSample, PoseUnavailableError, yaw_wxyz
 
 
 class JsonPoseSource:
@@ -36,7 +36,8 @@ class RealPathControl:
         if not 0 < self.max_skew_s <= settings.state_timeout_s:
             raise ValueError('max_state_skew_s must be positive and <= state_timeout_s')
         self.source = pose_source
-        if settings.enabled and self.source is None:
+        self.use_imu = settings.mode in ('heading', 'constant')
+        if settings.enabled and not self.use_imu and self.source is None:
             source_cfg = (cfg or {}).get('pose_source') or {}
             if source_cfg.get('type') != 'json_file' or not source_cfg.get('path'):
                 raise ValueError('Enable path control only with a configured localization source')
@@ -52,12 +53,22 @@ class RealPathControl:
         if requested[0] == 0 and requested[2] == 0:
             return self.controller.update(time.monotonic() if now_s is None else now_s, None, requested)
         try:
-            pose = self.source.snapshot()
-            if abs(pose.timestamp_s-state.received_at_ns*1e-9) > self.max_skew_s:
-                raise PoseUnavailableError('Localization and LowState timestamps are not aligned')
+            if self.use_imu:
+                try:
+                    yaw = yaw_wxyz(state.quaternion_wxyz)
+                except ValueError as exc:
+                    raise PoseUnavailableError(f'Invalid LowState IMU orientation: {exc}') from exc
+                pose = PoseSample(state.received_at_ns*1e-9, None, yaw,
+                                  frame_id=self.controller.cfg.frame_id)
+            else:
+                pose = self.source.snapshot()
+                if abs(pose.timestamp_s-state.received_at_ns*1e-9) > self.max_skew_s:
+                    raise PoseUnavailableError('Localization and LowState timestamps are not aligned')
             # Sample control time after I/O so a newly published pose is not
             # incorrectly classified as being in the future.
-            return self.controller.update(time.monotonic() if now_s is None else now_s, pose, requested)
+            command = self.controller.update(time.monotonic() if now_s is None else now_s, pose, requested)
+            self.controller.diagnostics['state_source'] = 'lowstate_imu' if self.use_imu else 'external_pose'
+            return command
         except PoseUnavailableError as exc:
             self.controller.diagnostics = {'state': 'INVALID', 'error': str(exc)}
             raise

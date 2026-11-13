@@ -33,12 +33,56 @@ class ReadyTests(unittest.TestCase):
     def test_timer_alone_cannot_make_ready(self):
         self.finish_ramp()
         q=self.s.q.copy();q[4]-=.2618;q[10]-=.2601
-        for t in np.arange(3.005,5.99,.005):self.step(float(t),q=q)
+        deadline=3.+self.cfg['ready_timeout_s']
+        for t in np.arange(3.005,deadline-.01,.005):self.step(float(t),q=q)
         self.assertEqual(self.c.phase,Phase.SETTLING)
-        with self.assertRaises(PostureNotReadyError) as caught:self.step(6.01,q=q)
+        with self.assertRaises(PostureNotReadyError) as caught:self.step(deadline+.01,q=q)
         self.assertEqual(caught.exception.details['worst_motor_slot'],4)
         with self.assertRaisesRegex(ValueError,'requires Ready'):
-            self.c.begin_policy(replace(self.s,q=q),self.base+6_010_000_000)
+            self.c.begin_policy(replace(self.s,q=q),self.base+round((deadline+.01)*1e9))
+
+    def test_transient_motion_can_settle_after_old_three_second_deadline(self):
+        self.finish_ramp()
+        dq=np.zeros(23);dq[4]=.266
+        for t in np.arange(3.005,6.3,.005):self.step(float(t),dq=dq)
+        self.assertEqual(self.c.phase,Phase.SETTLING)
+        for t in np.arange(6.3,6.79,.005):self.step(float(t))
+        self.assertEqual(self.c.phase,Phase.SETTLING)
+        self.step(6.81)
+        self.assertEqual(self.c.phase,Phase.READY)
+        self.assertEqual(self.c.generation,0)
+
+    def test_error_identifies_velocity_joint_and_position_joint_separately(self):
+        self.finish_ramp()
+        q=self.s.q.copy();q[0]+=.1071
+        dq=np.zeros(23);dq[4]=-.266
+        gyro=np.array([.15,0,0])
+        with self.assertRaises(PostureNotReadyError) as caught:
+            self.step(3.+self.cfg['ready_timeout_s']+.01,q=q,dq=dq,gyro=gyro)
+        d=caught.exception.details
+        self.assertEqual(d['blocking_checks'],['joint_velocity'])
+        self.assertEqual(d['fastest_joint'],'left_ankle_pitch_joint')
+        self.assertEqual(d['fastest_motor_slot'],4)
+        self.assertEqual(d['worst_joint'],'left_hip_pitch_joint')
+        self.assertIn('joint_velocity',str(caught.exception))
+        self.assertIn('left_ankle_pitch_joint',str(caught.exception))
+
+    def test_timestamp_regression_breaks_hold_and_revokes_ready(self):
+        self.finish_ramp()
+        for t in np.arange(3.005,3.52,.005):self.step(float(t))
+        self.assertEqual(self.c.phase,Phase.READY)
+        old=replace(self.s,received_at_ns=self.base+3_480_000_000)
+        self.c.output(old,self.base+3_520_000_000)
+        self.assertEqual(self.c.phase,Phase.SETTLING)
+        self.assertEqual(self.c.ready_since_ns,self.base+3_520_000_000)
+
+    def test_timeout_reports_incomplete_hold_even_when_last_sample_is_good(self):
+        self.finish_ramp()
+        deadline=3.+self.cfg['ready_timeout_s']
+        self.step(deadline-.2,gyro=np.array([.4,0,0]))
+        self.step(deadline-.1)
+        with self.assertRaises(PostureNotReadyError) as caught:self.step(deadline+.01)
+        self.assertEqual(caught.exception.details['blocking_checks'],['stable_hold_incomplete'])
 
     def test_fresh_stable_posture_is_required_for_hold_window(self):
         self.finish_ramp()
