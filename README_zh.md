@@ -32,6 +32,22 @@ python deploy_mujoco/deploy_mujoco.py --gamepad-device /dev/input/js1
 运行环境与验证命令见 [SETUP_zh.md](SETUP_zh.md)，代码来源见
 [复用说明](deploy_mujoco/UPSTREAM.md)。
 
+## G1 23DoF 真机适配
+
+真机新入口使用相同 Parkour 策略，默认只读订阅与推理：
+
+```bash
+source .venv-parkour/bin/activate
+python deploy_real/deploy_real.py --self-test
+python deploy_real/deploy_real.py --state-only --seconds 5
+python deploy_real/deploy_real.py --seconds 10
+```
+
+完整说明及当前硬件验证状态见 [23DoF Sim2Real](docs/sim2real_23dof.md)。
+真实 LowState、深度采集及 30 秒连续只读推理已通过；实际电机输出和步态尚未验证。
+XR 图像服务已按用户要求临时停止，自启动配置未修改。
+原 29DoF 真机程序保留为 `deploy_real/deploy_real_29dof.py`。
+
 ## 原 29DoF 模式
 
 原先的 29DoF FSM、舞蹈和起身流程保留在独立入口：
@@ -158,7 +174,7 @@ python deploy_mujoco/deploy_mujoco_29dof.py xml_path=g1_description/g1_29dof_Lie
 2. 运行deploy_real程序：
 
 ```bash
-python deploy_real/deploy_real.py
+python deploy_real/deploy_real_29dof.py
 ```
 
 3. Start键进入位控模式

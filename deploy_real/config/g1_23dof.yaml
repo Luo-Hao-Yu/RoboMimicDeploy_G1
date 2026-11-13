@@ -1,0 +1,47 @@
+# The ONNX/observation/action contract is shared with the MuJoCo configuration.
+policy_config: config/g1_23dof/parkour/params/deploy.yaml
+network: enp49s0
+domain_id: 0
+lowcmd_topic: rt/lowcmd
+lowstate_topic: rt/lowstate
+# Verify the physical robot revision before enabling motor commands.
+expected_mode_machine: 4
+camera:
+  source: ssh
+  ssh_host: unitree@192.168.123.164
+  remote_python: python3
+  identity_file: /home/luohaoyu/unitree_sdk2/.g1-ssh/id_ed25519
+  known_hosts: /home/luohaoyu/unitree_sdk2/.g1-ssh/known_hosts
+  serial: '233722073805'
+  width: 848
+  height: 480
+  fps: 60
+  virtual_width: 64
+  virtual_height: 36
+  virtual_fovy_deg: 58.29
+  stream_timeout_s: 0.15
+control:
+  motor_dt: 0.005
+  state_timeout_s: 0.1
+  depth_timeout_s: 0.15
+  action_timeout_s: 0.1
+  startup_timeout_s: 15.0
+  ramp_s: 3.0
+  # Ramping completion is not readiness; qualify fresh measured feedback.
+  ready_joint_tolerance_rad: 0.25
+  ready_max_joint_velocity_rad_s: 0.2
+  ready_max_gyro_rad_s: 0.2
+  ready_hold_s: 0.5
+  ready_timeout_s: 3.0
+  policy_blend_s: 1.0
+  damping_kd: 2.0
+  damping_duration_s: 1.0
+  max_tilt_rad: 0.8
+  max_temperature_c: 80.0
+  max_abs_action: 20.0
+  max_target_step_rad_s: 6.0
+  max_position_error_rad: 0.8
+  joystick_deadzone: 0.12
+  max_forward_m_s: 0.3
+  max_yaw_rad_s: 0.5
+  min_depth_valid_fraction: 0.25

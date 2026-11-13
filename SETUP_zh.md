@@ -103,5 +103,14 @@ python deploy_mujoco/deploy_mujoco_29dof.py xml_path=g1_description/g1_29dof_Lie
 
 原 Unitree SDK editable 安装位于 `.deps/unitree_sdk2_python`，
 提交为 `814556d15970dd2ecf1c9984e845ca02ab07e206`。
-真机入口 `deploy_real/deploy_real.py` 和配置仍属于原 29DoF 流程；
+原真机入口已保留为 `deploy_real/deploy_real_29dof.py`，其配置仍属于原 29DoF 流程；
 网卡为 `deploy_real/config/real.yaml` 中的 `enp49s0`，未进行真机通信验证。
+
+## 新 23DoF 真机入口
+
+`.venv-parkour` 已增加 `requirements-real.txt` 中的 SDK/DDS 依赖。
+`deploy_real/deploy_real.py` 默认只读接入 23DoF Parkour，
+部署参数位于 `deploy_real/config/g1_23dof.yaml`。
+真实 DDS 状态、深度采集及 30 秒只读推理已通过（约 50.03 Hz）。
+XR 图像服务已临时停止且未修改自启动，测试结束后相机已释放；尚未进行电机输出验证。
+详见 [23DoF Sim2Real](docs/sim2real_23dof.md)。

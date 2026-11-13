@@ -1,0 +1,4 @@
+# Install in .venv-parkour after requirements-parkour.txt.
+cyclonedds==0.10.2
+-e .deps/unitree_sdk2_python
+# pyrealsense2 is needed only on the machine with the physical USB camera.
