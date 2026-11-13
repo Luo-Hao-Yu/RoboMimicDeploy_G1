@@ -29,6 +29,8 @@ class ActionSample:
     command: np.ndarray | None = None
     proprio: np.ndarray | None = None
     depth_history: np.ndarray | None = None
+    requested_command: np.ndarray | None = None
+    path_diagnostics: dict | None = None
 
 
 class JointTrackingError(ValueError):

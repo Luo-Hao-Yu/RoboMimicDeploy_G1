@@ -6,6 +6,27 @@ lowcmd_topic: rt/lowcmd
 lowstate_topic: rt/lowstate
 # Verify the physical robot revision before enabling motor commands.
 expected_mode_machine: 4
+# No XY estimator is currently installed. Preserve direct remote commands.
+path_control:
+  enabled: false
+  mode: path
+  # Applied once localization is available and path control is enabled.
+  reference: current
+  origin_xy: [0.0, 0.0]
+  yaw_rad: 0.0
+  frame_id: start_local
+  heading_gain: 2.0
+  lookahead_m: 1.0
+  # Keep existing real limits; these are not the validated sim baseline.
+  max_forward_m_s: 0.3
+  max_yaw_rad_s: 0.5
+  state_timeout_s: 0.1
+  max_state_skew_s: 0.05
+  min_confidence: 0.8
+  manual_rebase: false
+  pose_source:
+    type: json_file
+    path: /tmp/g1_pelvis_pose.json
 camera:
   source: ssh
   ssh_host: unitree@192.168.123.164

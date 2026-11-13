@@ -18,6 +18,7 @@ from deploy_real.parkour_policy import ParkourPolicy
 from deploy_real.robot_state import RobotState
 from deploy_real.control import Controller, Phase, ActionSample, JointTrackingError, PostureNotReadyError, validate_state, velocity_command, START, SELECT, F1, A
 from deploy_real.depth_source import create_depth_source, preprocess_depth
+from deploy_real.path_control import RealPathControl
 
 
 def checked_depth(source, now_ns, policy, control):
@@ -43,6 +44,7 @@ class InferenceWorker:
     """Never owns DDS publisher; motor watchdog runs independently of inference."""
     def __init__(self, policy, transport, source, cfg):
         self.policy, self.transport, self.source, self.cfg = policy, transport, source, cfg
+        self.path_control = RealPathControl(cfg.get('path_control'), cfg['control'])
         self.lock = threading.Lock()
         self.generation = 0
         self.use_remote_command = False
@@ -71,6 +73,7 @@ class InferenceWorker:
             result = dict(self.metrics)
             result['policy_steps'] = self.count
             result['mean_inference_s'] = result.pop('total_inference_s') / max(1, self.count)
+            result['path_control'] = dict(self.path_control.controller.diagnostics)
             return result
 
     def run(self):
@@ -87,15 +90,19 @@ class InferenceWorker:
                 stamp, image = checked_depth(self.source, time.monotonic_ns(), self.policy, self.cfg['control'])
                 if generation != requested_generation:
                     self.policy.reset()
+                    self.path_control.reset()
                     generation = requested_generation
-                command = velocity_command(state, self.cfg['control']) if use_remote else np.zeros(3,np.float32)
+                requested = velocity_command(state, self.cfg['control']) if use_remote else np.zeros(3,np.float32)
+                command = self.path_control.update(state, requested)
                 inference_start = time.monotonic_ns()
                 action, target = self.policy.step(state, command, image)
                 if np.max(np.abs(action)) > self.cfg['control']['max_abs_action']:
                     raise ValueError('Excessive raw policy action')
                 result = ActionSample(target, action, time.monotonic_ns(), state.received_at_ns, stamp, generation,
                                       command=command.copy(), proprio=self.policy.last_proprio,
-                                      depth_history=self.policy.last_depth)
+                                      depth_history=self.policy.last_depth,
+                                      requested_command=requested.copy(),
+                                      path_diagnostics=dict(self.path_control.controller.diagnostics))
                 with self.lock:
                     self.latest = result
                     self.count += 1
@@ -270,6 +277,8 @@ def run(cfg, policy, enable, seconds, report=None, state_only=False):
                                 action_generation=action.generation if action is not None else None,
                                 controller_generation=controller.generation,
                                 command=action.command.tolist() if action is not None and action.command is not None else None,
+                                requested_command=action.requested_command.tolist() if action is not None and action.requested_command is not None else None,
+                                path_control=action.path_diagnostics if action is not None else None,
                             ))
                             last_trace_ns = now
                     if old_phase!=controller.phase:print('Phase:',controller.phase.value,flush=True)

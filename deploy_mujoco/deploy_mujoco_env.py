@@ -18,6 +18,7 @@ import yaml
 from scipy.spatial.transform import Rotation, Slerp
 
 from .gamepad_control import GamepadControl
+from .path_control import SimulationPathControl
 
 G1_29DOF_SDK_JOINT_NAMES: list[str] = [
     "left_hip_pitch_joint",
@@ -922,6 +923,9 @@ class DeployEnv:
 
     def reset(self) -> None:
         self.episode_length = 0
+        if getattr(self, 'path_control', None) is not None:
+            self.path_control.reset()
+            self.robot.velocity_command[:] = 0
         self.raw_action[:] = 0.0
         for term in self.action_terms:
             term.reset()
@@ -1983,6 +1987,7 @@ def run_deploy(config_path: str, args: Any) -> None:
     print(f"config={deploy_yaml}  policy_dir={policy_dir}")
     print(f"control: sim_dt={sim_dt}  step_dt={env_cfg['step_dt']}  decimation={decimation}")
 
+    requested_velocity = np.zeros(3, dtype=np.float32)
     velocity_command = np.zeros(3, dtype=np.float32)
     mj_model, mj_data, env, sdk_maps, sdk_stiffness, sdk_damping = _setup_simulation(
         env_cfg,
@@ -1991,6 +1996,19 @@ def run_deploy(config_path: str, args: Any) -> None:
         mimic,
         velocity_command,
     )
+    path_cfg = dict(deploy_cfg.get('path_control') or {})
+    path_reference = getattr(args, 'path_reference', None)
+    if path_reference is not None:
+        path_cfg['reference'] = path_reference
+    path_mode = getattr(args, 'path_mode', None)
+    if path_mode is not None:
+        path_cfg.update(enabled=path_mode != 'off', mode=path_mode if path_mode != 'off' else 'path')
+    if path_cfg.get('enabled', False):
+        ranges = env_cfg['commands']['base_velocity']['ranges']
+        if (path_cfg.get('max_forward_m_s', .65) > ranges['lin_vel_x'][1] or
+                path_cfg.get('max_yaw_rad_s', 1.) > min(abs(v) for v in ranges['ang_vel_z'])):
+            raise ValueError('Path limits exceed policy command limits')
+        env.path_control = SimulationPathControl(path_cfg, mj_model, mj_data)
     runtime = _make_policy_runtime(
         interface_type,
         deploy_cfg,
@@ -2017,7 +2035,7 @@ def run_deploy(config_path: str, args: Any) -> None:
             deadzone=float(control_cfg.get("deadzone", 0.12) if deadzone is None else deadzone),
         )
     key_callback = (
-        _make_key_callback(cmd_ranges, velocity_command)
+        _make_key_callback(cmd_ranges, requested_velocity)
         if cmd_ranges and control_mode == "keyboard" else None
     )
     print(f"input={control_mode}")
@@ -2048,8 +2066,11 @@ def run_deploy(config_path: str, args: Any) -> None:
                 counter += 1
                 if counter % decimation == 0:
                     if gamepad is not None:
-                        gamepad.update(velocity_command)
+                        gamepad.update(requested_velocity)
                     env.sync_robot_from_mujoco(mj_data.qpos, mj_data.qvel, sdk_maps.qposadr, sdk_maps.qveladr)
+                    path_control = getattr(env, 'path_control', None)
+                    velocity_command[:] = (path_control.update(requested_velocity) if path_control
+                                           else requested_velocity)
                     if mimic is not None:
                         mimic.update_for_step(env.episode_length, env.step_dt)
                     action = runtime.act()

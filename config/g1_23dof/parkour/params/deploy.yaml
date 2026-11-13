@@ -2,6 +2,19 @@ xml_path: g1_description/g1_23dof_parkour/scene.xml
 simulation_dt: 0.005
 simulation_duration: 600.0
 step_dt: 0.02
+path_control:
+  enabled: true
+  mode: path
+  # Latch current pelvis XY/yaw when starting straight or releasing a turn.
+  reference: current
+  origin_xy: [0.0, 0.0]
+  yaw_rad: 0.0
+  frame_id: mujoco_world
+  heading_gain: 2.0
+  lookahead_m: 1.0
+  max_yaw_rad_s: 1.0
+  max_forward_m_s: 0.65
+  manual_rebase: false
 sdk_joint_names:
 - left_hip_pitch_joint
 - left_hip_roll_joint

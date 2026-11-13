@@ -169,5 +169,84 @@ class RealPolicyTests(unittest.TestCase):
         self.assertLess(command[2],0)
         np.testing.assert_array_equal(velocity_command(replace(s,sticks=np.zeros(4)),self.cfg),0)
 
+    def test_corrected_command_enters_real_and_sim_observation_history(self):
+        import mujoco
+        from deploy_mujoco.path_control import SimulationPathControl
+        from deploy_real.path_control import RealPathControl
+        from common.path_controller import PoseSample
+        p = self.policy
+        p.reset()
+        cfg = copy.deepcopy(p.cfg)
+        cfg['path_control']['frame_id'] = 'local'
+        cfg['path_control']['reference'] = 'fixed'
+        path = Path(__file__).resolve().parents[1]/cfg['xml_path']
+        command = np.zeros(3, np.float32)
+        from deploy_mujoco.deploy_mujoco_env import _setup_simulation
+        model, data, env, maps, kp, kd = _setup_simulation(
+            _deploy_env_cfg_for_interface(cfg, 'depth_encoder_actor'), path, .005, None, command)
+        data.qpos[1] = .2
+        mujoco.mj_forward(model, data)
+        sim_path = SimulationPathControl(cfg['path_control'], model, data)
+        requested = np.array([.4, 0, 0], np.float32)
+        command[:] = sim_path.update(requested)
+        class Source:
+            def snapshot(self): return PoseSample(0, (0, .2), 0)
+        real_path = RealPathControl(cfg['path_control'], dict(max_forward_m_s=.65, max_yaw_rad_s=1.), Source())
+        state = replace(self.state(now=0), q=data.qpos[maps.qposadr].copy())
+        actual = real_path.update(state, requested, 0)
+        np.testing.assert_array_equal(actual, command)
+        env.sync_robot_from_mujoco(data.qpos, data.qvel, maps.qposadr, maps.qveladr)
+        expected = env.compute_obs()['obs']
+        p.step(state, actual, np.ones((36,64), np.float32))
+        np.testing.assert_allclose(p.last_proprio, expected, atol=2e-6)
+        term = next(t for t in p.env.obs_terms if t.name == 'velocity_commands')
+        np.testing.assert_array_equal(term.get_flat().reshape(8,3)[-1], command)
+        np.testing.assert_array_equal(requested, np.array([.4, 0, 0], np.float32))
+        env.path_control = sim_path
+        env.reset()
+        np.testing.assert_array_equal(command, 0)
+
+    def test_worker_uses_corrected_command_and_faults_on_lost_localization(self):
+        from deploy_real.deploy_real import InferenceWorker
+        from deploy_real.path_control import RealPathControl
+        from common.path_controller import PoseSample, PoseUnavailableError
+        state = replace(self.state(), sticks=np.array([0, 1., 0, 0]))
+        class Transport:
+            def snapshot(inner):
+                return replace(state, received_at_ns=time.monotonic_ns())
+        class Camera:
+            def read(inner):
+                return time.monotonic_ns(), np.ones((36,64), np.float32)
+        class Source:
+            fail = False
+            def snapshot(inner):
+                if inner.fail:
+                    raise PoseUnavailableError('Localization lost')
+                return PoseSample(time.monotonic(), (0, .2), 0)
+        source = Source()
+        cfg = load_config()
+        cfg['path_control'].update(enabled=True, frame_id='local', reference='fixed')
+        adapter = RealPathControl(cfg['path_control'], cfg['control'], source)
+        with patch('deploy_real.deploy_real.RealPathControl', return_value=adapter):
+            worker = InferenceWorker(self.policy, Transport(), Camera(), cfg)
+        worker.request(1, True)
+        worker.thread.start()
+        try:
+            deadline = time.monotonic()+1
+            while worker.count == 0 and worker.error is None and time.monotonic() < deadline:
+                time.sleep(.002)
+            sample, count = worker.snapshot()
+            self.assertGreater(count, 0)
+            self.assertAlmostEqual(sample.command[2], -2*np.arctan2(.2, 1.), places=6)
+            self.assertEqual(sample.requested_command[2], 0)
+            self.assertEqual(sample.path_diagnostics['state'], 'PATH_FOLLOW')
+            source.fail = True
+            worker.thread.join(timeout=1)
+            self.assertFalse(worker.thread.is_alive())
+            with self.assertRaisesRegex(RuntimeError, 'Localization lost'):
+                worker.snapshot()
+        finally:
+            worker.close()
+
 
 if __name__=='__main__':unittest.main()

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 import yaml
+from common.path_controller import PathSettings
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / 'deploy_real/config/g1_23dof.yaml'
@@ -38,4 +39,13 @@ def load_config(path=DEFAULT_CONFIG):
         raise ValueError('max_tilt_rad must be less than pi/2')
     if not 0 < cfg['camera']['stream_timeout_s'] <= control['depth_timeout_s']:
         raise ValueError('Camera timeout must not exceed depth watchdog')
+    path = cfg.get('path_control') or {}
+    settings = PathSettings.from_dict(path)
+    if settings.enabled:
+        if (settings.max_forward_m_s > control['max_forward_m_s'] or
+                settings.max_yaw_rad_s > control['max_yaw_rad_s']):
+            raise ValueError('Path limits must not exceed real control velocity limits')
+        source = path.get('pose_source') or {}
+        if source.get('type') != 'json_file' or not source.get('path'):
+            raise ValueError('Path control requires an external localization source')
     return cfg
