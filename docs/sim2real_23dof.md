@@ -105,6 +105,10 @@ python deploy_real/deploy_real.py --enable
 
 ## 按 A 后触发关节跟踪误差
 
+2026-11-14 已定位到与 `left_ankle_pitch_joint, elapsed=6.550s` 完全匹配的真实报告，
+并结合操作者确认的持续外部支撑分析了目标、实测与力矩轨迹，见
+[踝关节反复超限的原因与处理顺序](ankle_tracking_failure_20261114.md)。
+
 已在合成的双脚承重场景中复现同类切入错误，详见
 [承重切入诊断](real_handover_analysis.md)。该实验不等于真机故障重放。
 
