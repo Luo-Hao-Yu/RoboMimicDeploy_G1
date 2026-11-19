@@ -28,7 +28,7 @@ class TrackingDiagnosticsTests(TestCase):
 
     def test_fault_names_hardware_slot_and_rejects_candidate(self):
         # left shoulder yaw is compact 15, HG slot 17, policy index 13.
-        strict = dict(self.cfg['control'], tracking_recovery=dict(enabled=False))
+        strict = dict(self.cfg['control'], max_position_error_rad=.8, tracking_recovery=dict(enabled=False))
         c=Controller(self.policy,strict)
         c.phase=Phase.POLICY
         c.generation=1
@@ -103,7 +103,7 @@ class TrackingDiagnosticsTests(TestCase):
         raw,target=p.step(state,command,np.ones((36,64),np.float32))
         action=ActionSample(target.copy(),raw.copy(),3_000_000_000,3_000_000_000,3_000_000_000,1,
                             command=command,proprio=p.last_proprio,depth_history=p.last_depth)
-        strict = dict(self.cfg['control'], tracking_recovery=dict(enabled=False))
+        strict = dict(self.cfg['control'], max_position_error_rad=.8, tracking_recovery=dict(enabled=False))
         c=Controller(p,strict);c.phase=Phase.POLICY;c.generation=1
         c.phase_start_ns=1_000_000_000;c.last_time_ns=2_995_000_000
         c.last_target=np.clip(target,p.position_limits[:,0],p.position_limits[:,1])
