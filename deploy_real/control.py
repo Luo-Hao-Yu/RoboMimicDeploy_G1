@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 import numpy as np
 from deploy_mujoco.gamepad_control import axis_velocity
+from deploy_real.tracking_guard import TrackingGuard, TrackingGuardError
 
 START, SELECT, F1, A = (1 << n for n in (2, 3, 6, 8))
 
@@ -29,6 +30,8 @@ class ActionSample:
     command: np.ndarray | None = None
     proprio: np.ndarray | None = None
     depth_history: np.ndarray | None = None
+    requested_command: np.ndarray | None = None
+    path_diagnostics: dict | None = None
 
 
 class JointTrackingError(ValueError):
@@ -36,11 +39,14 @@ class JointTrackingError(ValueError):
     def __init__(self, details):
         self.details = details
         worst = details['joints'][0]
+        reason = details.get('reason')
+        comparison = (f"error={worst['error_rad']:+.4f} rad; reason={reason}; " if reason else
+                      f"error={worst['error_rad']:+.4f} rad > {details['limit_rad']:.4f} rad; ")
         super().__init__(
-            f"Target/measured joint tracking error exceeds limit: {worst['name']} "
+            f"Target/measured joint tracking protection: {worst['name']} "
             f"(motor {worst['motor_slot']}), target={worst['candidate_target_rad']:.4f} rad, "
             f"measured={worst['measured_q_rad']:.4f} rad, "
-            f"error={worst['error_rad']:+.4f} rad > {details['limit_rad']:.4f} rad; "
+            f"{comparison}"
             f"phase={details['phase']}, elapsed={details['phase_elapsed_s']:.3f}s. "
             "Candidate was not sent."
         )
@@ -49,12 +55,17 @@ class JointTrackingError(ValueError):
 class PostureNotReadyError(ValueError):
     def __init__(self, details):
         self.details = details
+        reasons = ', '.join(details.get('blocking_checks', [])) or 'stable_hold_incomplete'
         super().__init__(
-            f"Posture not ready: {details['worst_joint']} (motor {details['worst_motor_slot']}), "
+            f"Posture not ready: blocking={reasons}; "
+            f"largest position error: {details['worst_joint']} (motor {details['worst_motor_slot']}), "
             f"q_error={details['max_q_error_rad']:.4f} rad "
             f"(limit {details['q_tolerance_rad']:.4f}), "
-            f"max_dq={details['max_dq_rad_s']:.4f} rad/s, "
-            f"gyro_norm={details['gyro_norm_rad_s']:.4f} rad/s; "
+            f"max_dq={details['max_dq_rad_s']:.4f} rad/s "
+            f"at {details.get('fastest_joint', 'unknown')} "
+            f"(limit {details['max_dq_limit_rad_s']:.4f}), "
+            f"gyro_norm={details['gyro_norm_rad_s']:.4f} rad/s "
+            f"(limit {details['gyro_limit_rad_s']:.4f}); "
             "posture settling failed; policy not enabled"
         )
 
@@ -110,6 +121,7 @@ class Controller:
         self.settling_start_ns = None
         self.ready_since_ns = None
         self.ready_last_sample_ns = None
+        self.tracking_guard = TrackingGuard(cfg)
 
     def buttons(self, state):
         # A held button on connection cannot cause an unintentional transition.
@@ -135,12 +147,20 @@ class Controller:
         velocity_limit = self.cfg.get('ready_max_joint_velocity_rad_s', .2)
         gyro_limit = self.cfg.get('ready_max_gyro_rad_s', .2)
         max_dq = float(np.max(np.abs(state.dq)))
+        fastest = int(np.argmax(np.abs(state.dq)))
         gyro_norm = float(np.linalg.norm(state.gyro))
-        good = (np.isfinite(error).all() and np.isfinite(state.dq).all()
-                and np.isfinite(state.gyro).all() and float(error[worst]) <= q_tolerance
-                and max_dq <= velocity_limit and gyro_norm <= gyro_limit)
+        blocking = []
+        if not (np.isfinite(error).all() and np.isfinite(state.dq).all() and np.isfinite(state.gyro).all()):
+            blocking.append('nonfinite_state')
+        if float(error[worst]) > q_tolerance: blocking.append('joint_position')
+        if max_dq > velocity_limit: blocking.append('joint_velocity')
+        if gyro_norm > gyro_limit: blocking.append('body_angular_velocity')
+        good = not blocking
         return dict(qualified=bool(good), worst_joint=self.policy.env.sdk_joint_names[worst],
                     worst_motor_slot=int(self.policy.motor_indices[worst]),
+                    fastest_joint=self.policy.env.sdk_joint_names[fastest],
+                    fastest_motor_slot=int(self.policy.motor_indices[fastest]),
+                    blocking_checks=blocking,
                     max_q_error_rad=float(error[worst]), q_tolerance_rad=q_tolerance,
                     max_dq_rad_s=max_dq, max_dq_limit_rad_s=velocity_limit,
                     gyro_norm_rad_s=gyro_norm, gyro_limit_rad_s=gyro_limit)
@@ -150,6 +170,7 @@ class Controller:
         # A missed/stale observation breaks the continuous qualification window.
         age = (now_ns-state.received_at_ns)*1e-9
         fresh = 0 <= age <= self.cfg['state_timeout_s']
+        if not fresh: details['blocking_checks'].append('state_age')
         if not details['qualified'] or not fresh:
             self.ready_since_ns = None
             if self.phase == Phase.READY:
@@ -157,20 +178,29 @@ class Controller:
                 self.settling_start_ns = now_ns
         elif state.received_at_ns != self.ready_last_sample_ns:
             if (self.ready_last_sample_ns is not None and
-                    (state.received_at_ns-self.ready_last_sample_ns)*1e-9 > self.cfg['state_timeout_s']):
+                    (state.received_at_ns < self.ready_last_sample_ns or
+                     (state.received_at_ns-self.ready_last_sample_ns)*1e-9 > self.cfg['state_timeout_s'])):
                 self.ready_since_ns = None
+                if self.phase == Phase.READY:
+                    self.phase = Phase.SETTLING
+                    self.settling_start_ns = now_ns
             if self.ready_since_ns is None:
                 self.ready_since_ns = now_ns
             elif (now_ns-self.ready_since_ns)*1e-9 >= self.cfg.get('ready_hold_s', .5):
                 self.phase = Phase.READY
         self.ready_last_sample_ns = state.received_at_ns
-        if self.phase == Phase.SETTLING and (now_ns-self.settling_start_ns)*1e-9 >= self.cfg.get('ready_timeout_s', 3.):
+        if self.phase == Phase.SETTLING and (now_ns-self.settling_start_ns)*1e-9 >= self.cfg.get('ready_timeout_s', 8.):
+            if not details['blocking_checks']:
+                details['blocking_checks'].append('stable_hold_incomplete')
             details.update(measured_q_rad=state.q.tolist(), measured_dq_rad_s=state.dq.tolist(),
                            target_q_rad=self.policy.default_q.tolist(),
                            quaternion_wxyz=state.quaternion_wxyz.tolist(), gyro=state.gyro.tolist(),
                            motor_modes=state.motor_modes.tolist() if state.motor_modes is not None else None,
                            tau_est_nm=state.tau_est.tolist() if state.tau_est is not None else None,
-                           state_age_s=age, settling_elapsed_s=(now_ns-self.settling_start_ns)*1e-9)
+                           state_age_s=age, settling_elapsed_s=(now_ns-self.settling_start_ns)*1e-9,
+                           settling_timeout_s=self.cfg.get('ready_timeout_s', 8.),
+                           stable_hold_s=0. if self.ready_since_ns is None else (now_ns-self.ready_since_ns)*1e-9,
+                           required_hold_s=self.cfg.get('ready_hold_s', .5))
             raise PostureNotReadyError(details)
 
     def begin_policy(self, state, now_ns):
@@ -183,6 +213,7 @@ class Controller:
         self.phase = Phase.POLICY
         self.phase_start_ns = now_ns
         self.generation += 1
+        self.tracking_guard.reset()
         return self.generation
 
     def fault(self, reason):
@@ -194,6 +225,8 @@ class Controller:
             return np.zeros(23), np.zeros(23), np.full(23, self.cfg['damping_kd'])
         if self.phase == Phase.WAITING:
             return None
+        if state.q.shape != (23,) or not np.isfinite(state.q).all():
+            raise ValueError('Invalid measured joint positions')
         elapsed = (now_ns - self.phase_start_ns) * 1e-9
         kp, kd = self.policy.kp.copy(), self.policy.kd.copy()
         if self.phase == Phase.RAMP:
@@ -235,7 +268,18 @@ class Controller:
         step = self.cfg['max_target_step_rad_s'] * dt
         target = np.clip(target, self.last_target-step, self.last_target+step)
         errors = target-state.q
-        if np.max(np.abs(errors)) > self.cfg['max_position_error_rad']:
+        rejected_target = target.copy()
+        reason = None
+        fault_limit = self.cfg['max_position_error_rad']
+        if self.phase == Phase.POLICY and self.tracking_guard.cfg['enabled']:
+            try:
+                target = self.tracking_guard.apply(position_limited_target, target, self.last_target,
+                    state.q, self.policy.position_limits, step, now_ns, state.received_at_ns)
+            except TrackingGuardError as exc:
+                reason, fault_limit = exc.reason, exc.limit_rad
+        elif np.max(np.abs(errors)) > fault_limit:
+            reason = 'strict_tracking_error'
+        if reason is not None:
             matching_action = action is not None and action.generation == self.generation
             policy_indices = np.argsort(self.policy.env.joint_ids_map)
             joints = []
@@ -250,7 +294,7 @@ class Controller:
                     policy_target_rad=float(action.target[j]) if matching_action else None,
                     blended_target_rad=float(blended_target[j]),
                     position_limited_target_rad=float(position_limited_target[j]),
-                    candidate_target_rad=float(target[j]), previous_target_rad=float(self.last_target[j]),
+                    candidate_target_rad=float(rejected_target[j]), previous_target_rad=float(self.last_target[j]),
                     error_rad=float(errors[j]),
                     # This is an estimate from the candidate, not measured motor torque.
                     candidate_pd_torque_estimate_nm=float(kp[j]*errors[j]-kd[j]*state.dq[j]),
@@ -259,7 +303,8 @@ class Controller:
             raise JointTrackingError(dict(
                 phase=self.phase.value, phase_elapsed_s=elapsed,
                 policy_blend_fraction=min(1., elapsed/self.cfg['policy_blend_s']) if self.phase == Phase.POLICY else None,
-                limit_rad=self.cfg['max_position_error_rad'], tick=int(state.tick),
+                limit_rad=fault_limit, tick=int(state.tick), reason=reason,
+                tracking_recovery=self.tracking_guard.statistics(),
                 state_age_s=(now_ns-state.received_at_ns)*1e-9,
                 action_generation=action.generation if action is not None else None,
                 controller_generation=self.generation,

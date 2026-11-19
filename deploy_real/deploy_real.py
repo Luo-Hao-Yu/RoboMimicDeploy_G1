@@ -18,6 +18,7 @@ from deploy_real.parkour_policy import ParkourPolicy
 from deploy_real.robot_state import RobotState
 from deploy_real.control import Controller, Phase, ActionSample, JointTrackingError, PostureNotReadyError, validate_state, velocity_command, START, SELECT, F1, A
 from deploy_real.depth_source import create_depth_source, preprocess_depth
+from deploy_real.path_control import RealPathControl
 
 
 def checked_depth(source, now_ns, policy, control):
@@ -43,6 +44,7 @@ class InferenceWorker:
     """Never owns DDS publisher; motor watchdog runs independently of inference."""
     def __init__(self, policy, transport, source, cfg):
         self.policy, self.transport, self.source, self.cfg = policy, transport, source, cfg
+        self.path_control = RealPathControl(cfg.get('path_control'), cfg['control'])
         self.lock = threading.Lock()
         self.generation = 0
         self.use_remote_command = False
@@ -71,6 +73,7 @@ class InferenceWorker:
             result = dict(self.metrics)
             result['policy_steps'] = self.count
             result['mean_inference_s'] = result.pop('total_inference_s') / max(1, self.count)
+            result['path_control'] = dict(self.path_control.controller.diagnostics)
             return result
 
     def run(self):
@@ -87,15 +90,19 @@ class InferenceWorker:
                 stamp, image = checked_depth(self.source, time.monotonic_ns(), self.policy, self.cfg['control'])
                 if generation != requested_generation:
                     self.policy.reset()
+                    self.path_control.reset()
                     generation = requested_generation
-                command = velocity_command(state, self.cfg['control']) if use_remote else np.zeros(3,np.float32)
+                requested = velocity_command(state, self.cfg['control']) if use_remote else np.zeros(3,np.float32)
+                command = self.path_control.update(state, requested)
                 inference_start = time.monotonic_ns()
                 action, target = self.policy.step(state, command, image)
                 if np.max(np.abs(action)) > self.cfg['control']['max_abs_action']:
                     raise ValueError('Excessive raw policy action')
                 result = ActionSample(target, action, time.monotonic_ns(), state.received_at_ns, stamp, generation,
                                       command=command.copy(), proprio=self.policy.last_proprio,
-                                      depth_history=self.policy.last_depth)
+                                      depth_history=self.policy.last_depth,
+                                      requested_command=requested.copy(),
+                                      path_diagnostics=dict(self.path_control.controller.diagnostics))
                 with self.lock:
                     self.latest = result
                     self.count += 1
@@ -137,9 +144,11 @@ def self_test(policy, steps):
 
 
 def camera_check(policy, cfg, seconds, report=None):
-    source = create_depth_source(cfg['camera'])
+    source = None
+    result = {'camera_check':'FAIL', 'requested_seconds':seconds}
     stamps=set(); start=time.monotonic(); deadline=start+cfg['control']['startup_timeout_s']
     try:
+        source = create_depth_source(cfg['camera'])
         while source.read() is None:
             if time.monotonic()>deadline: raise TimeoutError('Camera startup timed out')
             time.sleep(.01)
@@ -155,11 +164,17 @@ def camera_check(policy, cfg, seconds, report=None):
         result = {'camera_check':'PASS','unique_frames':len(stamps),'max_age_s':max(ages),
                   'min_valid_crop_fraction':min(valid), 'seconds':time.monotonic()-start}
         print(json.dumps(result,indent=2))
-        if report:
-            path=Path(report);path.parent.mkdir(parents=True,exist_ok=True)
-            path.write_text(json.dumps(result,indent=2)+'\n')
+    except Exception as exc:
+        result.update(error=str(exc), error_kind=getattr(exc,'kind',type(exc).__name__))
+        raise
     finally:
-        source.close()
+        try:
+            if source is not None:
+                source.close()
+        finally:
+            if report:
+                path=Path(report);path.parent.mkdir(parents=True,exist_ok=True)
+                path.write_text(json.dumps(result,indent=2)+'\n')
 
 
 def run(cfg, policy, enable, seconds, report=None, state_only=False):
@@ -179,6 +194,7 @@ def run(cfg, policy, enable, seconds, report=None, state_only=False):
     recent_commands = deque(maxlen=250)
     last_trace_ns = None
     action = None
+    was_tracking_recovery = False
     try:
         print('ENABLED: Start -> posture ramp, release Start, then A -> policy; Select/F1 stop.' if enable
               else 'MONITOR ONLY: no LowCmd publisher, no control release; Select exits.',flush=True)
@@ -254,6 +270,10 @@ def run(cfg, policy, enable, seconds, report=None, state_only=False):
                     output=controller.output(state,now,action)
                     if output is not None:
                         transport.send(*output,mode_machine=mode_machine)
+                        recovering = controller.tracking_guard.active
+                        if recovering != was_tracking_recovery:
+                            print('Tracking recovery: '+('limiting targets' if recovering else 'normal tracking resumed'), flush=True)
+                            was_tracking_recovery = recovering
                         if last_trace_ns is None or now-last_trace_ns >= int(policy.dt*1e9):
                             recent_commands.append(dict(
                                 monotonic_ns=now, phase=controller.phase.value, tick=int(state.tick),
@@ -270,6 +290,9 @@ def run(cfg, policy, enable, seconds, report=None, state_only=False):
                                 action_generation=action.generation if action is not None else None,
                                 controller_generation=controller.generation,
                                 command=action.command.tolist() if action is not None and action.command is not None else None,
+                                requested_command=action.requested_command.tolist() if action is not None and action.requested_command is not None else None,
+                                path_control=action.path_diagnostics if action is not None else None,
+                                tracking_recovery=dict(controller.tracking_guard.diagnostics),
                             ))
                             last_trace_ns = now
                     if old_phase!=controller.phase:print('Phase:',controller.phase.value,flush=True)
@@ -278,20 +301,31 @@ def run(cfg, policy, enable, seconds, report=None, state_only=False):
                 if enable and controller.phase in (Phase.RAMP, Phase.SETTLING, Phase.READY):
                     ready = controller.readiness(state)
                     print(f"posture: worst={ready['worst_joint']} q_error={ready['max_q_error_rad']:.3f} rad "
-                          f"max_dq={ready['max_dq_rad_s']:.3f} gyro={ready['gyro_norm_rad_s']:.3f} rad/s",flush=True)
+                          f"max_dq={ready['max_dq_rad_s']:.3f} at {ready['fastest_joint']} "
+                          f"gyro={ready['gyro_norm_rad_s']:.3f} rad/s "
+                          f"blocking={','.join(ready['blocking_checks']) or 'none'}",flush=True)
+                    if controller.phase == Phase.SETTLING:
+                        waited = (now-controller.settling_start_ns)*1e-9
+                        held = 0. if controller.ready_since_ns is None else (now-controller.ready_since_ns)*1e-9
+                        print(f"settling: elapsed={waited:.2f}/{control['ready_timeout_s']:.2f}s "
+                              f"stable={held:.2f}/{control['ready_hold_s']:.2f}s; policy not enabled",flush=True)
                 print(f'phase={controller.phase.value} tick={state.tick} policy_steps={result["policy_steps"]} state_age_ms={(now-state.received_at_ns)*1e-6:.1f}',flush=True)
+                if controller.tracking_guard.active:
+                    print('tracking_recovery:', controller.tracking_guard.statistics(), flush=True)
                 last_print=time.monotonic()
             next_motor+=control['motor_dt']
             delay=next_motor-time.monotonic()
             if delay< -control['motor_dt']:next_motor=time.monotonic()
             time.sleep(max(0,delay))
         result.update(status='PASS',state_samples=count,seconds=time.monotonic()-start)
+        result['tracking_recovery'] = controller.tracking_guard.statistics()
         if worker is not None:
             result.update(worker.statistics())
             result['policy_hz'] = result['policy_steps']/result['seconds']
         if not state_only and result['policy_steps']==0:raise ValueError('No inference completed')
         print(json.dumps(result,indent=2),flush=True)
     except BaseException as exc:
+        result['failure_monotonic_ns'] = time.monotonic_ns()
         result['phase_at_failure'] = controller.phase.value
         controller.fault(exc)
         result.update(status='FAIL',error=str(exc),state_samples=count)
@@ -314,6 +348,7 @@ def run(cfg, policy, enable, seconds, report=None, state_only=False):
             result.update(worker.statistics())
         raise
     finally:
+        result['tracking_recovery'] = controller.tracking_guard.statistics()
         if enable:
             result['recent_motor_commands'] = list(recent_commands)
             result['config'] = cfg
@@ -321,6 +356,14 @@ def run(cfg, policy, enable, seconds, report=None, state_only=False):
             result['compact_to_motor_slots'] = list(policy.motor_indices)
         # Damping does not depend on camera/ONNX cleanup and runs before those joins.
         if owns_control and mode_machine is not None:
+            shutdown = dict(start_monotonic_ns=time.monotonic_ns(),
+                            kind='damping_only', kp=0.0, kd=control['damping_kd'],
+                            send_attempts=0, successful_sends=0, feedback=[])
+            result['shutdown'] = shutdown
+            # Observe the existing damping interval; no additional motor commands
+            # or longer shutdown period are introduced for diagnostic sampling.
+            shutdown_feedback = deque(maxlen=100)
+            last_shutdown_trace_ns = last_shutdown_state_ns = None
             end=time.monotonic()+control['damping_duration_s']
             while time.monotonic()<end:
                 try:
@@ -328,12 +371,36 @@ def run(cfg, policy, enable, seconds, report=None, state_only=False):
                     with transport.lock:
                         current = transport.latest
                     if current is not None and current.mode_machine != mode_machine:
+                        shutdown['stop_reason'] = 'hardware_mode_changed'
                         print('Hardware mode changed; LowCmd output stopped',file=sys.stderr)
                         break
+                    shutdown['send_attempts'] += 1
                     transport.send_damping(control['damping_kd'],mode_machine)
+                    shutdown['successful_sends'] += 1
                 except Exception as exc:
+                    shutdown['stop_reason'] = 'damping_publish_failed'
+                    shutdown['error'] = str(exc)
                     print(f'Damping publish failed: {exc}',file=sys.stderr);break
+                observed_ns = time.monotonic_ns()
+                if (current is not None and current.received_at_ns != last_shutdown_state_ns and
+                        (last_shutdown_trace_ns is None or observed_ns-last_shutdown_trace_ns >= 20_000_000)):
+                    try:
+                        shutdown_feedback.append(dict(monotonic_ns=observed_ns,
+                            state_received_ns=current.received_at_ns,
+                            state_age_s=(observed_ns-current.received_at_ns)*1e-9,
+                            tick=int(current.tick), mode_machine=int(current.mode_machine),
+                            quaternion_wxyz=current.quaternion_wxyz.tolist(), gyro=current.gyro.tolist(),
+                            measured_q_rad=current.q.tolist(), measured_dq_rad_s=current.dq.tolist(),
+                            motor_errors=current.motor_errors.tolist()))
+                        last_shutdown_trace_ns = observed_ns
+                        last_shutdown_state_ns = current.received_at_ns
+                    except Exception as trace_error:
+                        # A diagnostic failure must not suppress damping output.
+                        shutdown['feedback_error'] = str(trace_error)
                 time.sleep(control['motor_dt'])
+            shutdown['feedback'] = list(shutdown_feedback)
+            shutdown['end_monotonic_ns'] = time.monotonic_ns()
+            shutdown.setdefault('stop_reason', 'interval_complete')
         for resource in (worker, source, transport):
             if resource is not None:
                 try:

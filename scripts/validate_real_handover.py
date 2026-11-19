@@ -18,10 +18,19 @@ from deploy_mujoco import deploy_mujoco_env as sim
 
 root=Path(__file__).resolve().parents[1]
 
-def run(warmup, blend=1.0, executed_history=False, seconds=10.0):
+def run(warmup, blend=1.0, executed_history=False, seconds=10.0, *, vx=0., wz=0.,
+        recovery=None, flat=False, policy_start=False):
     cfg=load_config();cfg['control']['policy_blend_s']=blend;p=ParkourPolicy(cfg['policy_config'])
+    if recovery is not None: cfg['control']['tracking_recovery']['enabled']=recovery
     m,d,env,maps,kp,kd=sim._setup_simulation(sim._deploy_env_cfg_for_interface(p.cfg,'depth_encoder_actor'),
         root/p.cfg['xml_path'],.005,None,np.zeros(3,np.float32))
+    if flat:
+        for gid in range(m.ngeom):
+            if m.geom_bodyid[gid]==0 and m.geom_type[gid]==mujoco.mjtGeom.mjGEOM_BOX:
+                m.geom_contype[gid]=m.geom_conaffinity[gid]=0
+                m.geom_pos[gid,2]=-10
+        m.geom_pos[m.geom('floor').id,2]=0
+        mujoco.mj_forward(m,d)
     renderer=mujoco.Renderer(m,height=36,width=64);renderer.enable_depth_rendering()
     option=mujoco.MjvOption();option.geomgroup[:]=0;option.geomgroup[[1,2]]=1
     def state():
@@ -32,8 +41,21 @@ def run(warmup, blend=1.0, executed_history=False, seconds=10.0):
     c.settling_start_ns=1_000_000_000
     c.last_target=p.default_q.copy();c.last_time_ns=1_000_000_000
     target=p.default_q.copy();action=None;max_error=0.;min_z=.8;points=[]
+    if policy_start:
+        # Synthetic isolation of the policy loop, NOT a hardware entry path.
+        c.phase=Phase.POLICY;c.generation=1
+        c.phase_start_ns=1_000_000_000-round(blend*1e9)
+        p.reset()
+        step=0
+        s=state()
+        renderer.update_scene(d,camera='depth_cam',scene_option=option)
+        raw,desired=p.step(s,np.zeros(3,np.float32),renderer.render())
+        action=ActionSample(desired,raw,1_000_000_000,1_000_000_000,1_000_000_000,1)
+    recovery_events=[];previous_recovery=False;max_target_rate=0.
     report={'synthetic':True,'warmup_s':warmup,'policy_blend_s':cfg['control']['policy_blend_s'],
-            'target_rate_limit_rad_s':cfg['control']['max_target_step_rad_s'],'executed_history':executed_history}
+            'target_rate_limit_rad_s':cfg['control']['max_target_step_rad_s'],'executed_history':executed_history,
+            'requested_command':[vx,0,wz],'flat':flat,'synthetic_policy_start':policy_start,
+            'tracking_recovery_config':cfg['control']['tracking_recovery']}
     try:
         for step in range(1,round(seconds/.005)+1):
             d.ctrl[maps.actuator]=sim.pd_control(target,d.qpos[maps.qposadr],kp,np.zeros(23),d.qvel[maps.qveladr],kd)
@@ -51,10 +73,17 @@ def run(warmup, blend=1.0, executed_history=False, seconds=10.0):
                 if executed_history:
                     previous_policy_q=target[p.env.joint_ids_map]
                     p.env.raw_action[:]=(previous_policy_q-np.asarray(p.metadata['action_offset_rad']))/np.asarray(p.metadata['action_scale'])
-                raw,desired=p.step(s,np.zeros(3,np.float32),renderer.render())
+                # Keep zero commands during the handover blend, then test walking.
+                command=np.array([vx,0,wz] if (now-c.phase_start_ns)*1e-9>=blend+1 else [0,0,0],np.float32)
+                raw,desired=p.step(s,command,renderer.render())
                 action=ActionSample(desired,raw,now,now,now,c.generation)
             output=c.output(s,now,action)
+            previous_target=target.copy()
             target,kp,kd=output
+            max_target_rate=max(max_target_rate,float(np.max(np.abs(target-previous_target))/.005))
+            if c.tracking_guard.active != previous_recovery:
+                recovery_events.append(dict(time_s=float(d.time),**c.tracking_guard.statistics()))
+                previous_recovery=c.tracking_guard.active
             err=float(np.max(np.abs(target-s.q)));max_error=max(max_error,err);min_z=min(min_z,float(d.qpos[2]))
             if step%100==0:points.append({'t':d.time,'z':float(d.qpos[2]),'max_error_rad':err})
             if d.qpos[2]<.5:
@@ -64,8 +93,10 @@ def run(warmup, blend=1.0, executed_history=False, seconds=10.0):
         report.update(status='FAIL',error=str(exc),time_s=d.time)
         if isinstance(exc,JointTrackingError):report['tracking_error']=exc.details
     finally:renderer.close()
-    report.update(max_error_rad=max_error,min_z=min_z,points=points)
-    print(json.dumps({k:v for k,v in report.items() if k not in ('points','tracking_error')}),flush=True)
+    report.update(max_error_rad=max_error,min_z=min_z,points=points,
+                  max_target_rate_rad_s=max_target_rate,final_position=d.qpos[:3].tolist(),
+                  tracking_recovery=c.tracking_guard.statistics(),recovery_events=recovery_events)
+    print(json.dumps({k:v for k,v in report.items() if k not in ('points','tracking_error','recovery_events')}),flush=True)
     return report
 
 if __name__=='__main__':
@@ -76,11 +107,21 @@ if __name__=='__main__':
     parser.add_argument('--seconds',type=float,default=10.)
     parser.add_argument('--executed-history',action='store_true',help='Diagnostic ablation only')
     parser.add_argument('--report',type=Path,default=root/'logs/sim2real/grounded_handover_validation.json')
+    parser.add_argument('--vx',type=float,default=0.)
+    parser.add_argument('--wz',type=float,default=0.)
+    parser.add_argument('--flat',action='store_true')
+    parser.add_argument('--tracking-recovery',choices=('configured','on','off'),default='configured')
+    parser.add_argument('--policy-start',action='store_true',help='Synthetic policy loop only; bypasses simulated Ready qualification')
     args=parser.parse_args()
     if (not np.isfinite([args.warmup,args.blend,args.seconds]).all() or
             args.blend<=0 or args.warmup<0 or args.seconds<=args.warmup):
         parser.error('Require finite blend>0 and seconds>warmup>=0')
-    result=run(args.warmup,args.blend,args.executed_history,args.seconds)
+    limits=load_config()['control']
+    if not np.isfinite([args.vx,args.wz]).all() or not 0<=args.vx<=limits['max_forward_m_s'] or abs(args.wz)>limits['max_yaw_rad_s']:
+        parser.error('Requested command must be within real velocity limits')
+    recovery=None if args.tracking_recovery=='configured' else args.tracking_recovery=='on'
+    result=run(args.warmup,args.blend,args.executed_history,args.seconds,
+               vx=args.vx,wz=args.wz,flat=args.flat,recovery=recovery,policy_start=args.policy_start)
     args.report.parent.mkdir(parents=True,exist_ok=True)
     args.report.write_text(json.dumps(result,indent=2)+'\n')
     raise SystemExit(0 if result['status']=='PASS' else 1)

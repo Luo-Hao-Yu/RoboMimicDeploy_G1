@@ -31,6 +31,8 @@ class RealSense:
     def __init__(self, cfg):
         # Keep hardware imports optional for offline tests and model checks.
         import pyrealsense2 as rs
+        from .camera_stream import check_depth_profile
+        check_depth_profile(rs, cfg)
         self.pipeline = rs.pipeline()
         try:
             settings = rs.config()

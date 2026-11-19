@@ -14,13 +14,14 @@ sys.path.insert(0, str(ROOT))
 
 import mujoco
 import numpy as np
+from deploy_mujoco.path_control import SimulationPathControl
 from deploy_mujoco.deploy_mujoco_env import (
     _deploy_env_cfg_for_interface, _make_policy_runtime, _setup_simulation,
     load_deploy_config, pd_control, policy_dir_from_deploy_yaml, resolve_path,
 )
 
 
-def validate(seconds=10.0, vx=0.0, warmup=2.0, report=None):
+def validate(seconds=10.0, vx=0.0, warmup=2.0, report=None, path_mode=None):
     path, cfg = load_deploy_config('config/g1_23dof/parkour/params/deploy.yaml', ROOT)
     cfg['policy_interface']['preview_depth'] = False
     if seconds <= 0 or warmup < 0 or not np.isfinite([seconds, vx, warmup]).all():
@@ -33,6 +34,13 @@ def validate(seconds=10.0, vx=0.0, warmup=2.0, report=None):
         _deploy_env_cfg_for_interface(cfg, 'depth_encoder_actor'),
         resolve_path(cfg['xml_path'], ROOT), cfg['simulation_dt'], None, command,
     )
+    path_cfg = dict(cfg.get('path_control') or {})
+    # Course validation measures error against the known platform centreline.
+    path_cfg.update(reference='fixed', manual_rebase=False)
+    if path_mode is not None:
+        path_cfg.update(enabled=path_mode != 'off', mode=path_mode if path_mode != 'off' else 'path')
+    path_control = SimulationPathControl(path_cfg, model, data)
+    env.path_control = path_control
     runtime = _make_policy_runtime('depth_encoder_actor', cfg, policy_dir_from_deploy_yaml(path), env, data, maps, command, 'cpu')
     target = env.target_sdk_joint_pos()
     min_z = float(data.qpos[2])
@@ -55,7 +63,8 @@ def validate(seconds=10.0, vx=0.0, warmup=2.0, report=None):
             if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all() or any(w.number for w in data.warning):
                 raise FloatingPointError('Invalid MuJoCo state or physics warning')
             if count % decimation == 0:
-                command[0] = vx if data.time >= warmup else 0
+                requested = np.array([vx if data.time >= warmup else 0, 0, 0], np.float32)
+                command[:] = path_control.update(requested)
                 env.sync_robot_from_mujoco(data.qpos, data.qvel, maps.qposadr, maps.qveladr)
                 action = runtime.act()
                 assert action.shape == (23,) and np.isfinite(action).all()
@@ -71,7 +80,8 @@ def validate(seconds=10.0, vx=0.0, warmup=2.0, report=None):
                 if cross_track > terrain['plank_length'] / 2 and first_off_course_time is None:
                     first_off_course_time = float(data.time)
                 if env.episode_length % 50 == 0:
-                    point = {'time': round(data.time, 3), 'position': data.qpos[:3].tolist(), 'tilt_deg': tilt}
+                    point = {'time': round(data.time, 3), 'position': data.qpos[:3].tolist(), 'tilt_deg': tilt,
+                             'command': command.tolist(), 'path_control': dict(path_control.controller.diagnostics)}
                     trajectory.append(point)
                     print(json.dumps(point), flush=True)
                 if z < 0.5 or tilt > 60:
@@ -87,6 +97,7 @@ def validate(seconds=10.0, vx=0.0, warmup=2.0, report=None):
                   'max_abs_action': max_action, 'final_position': data.qpos[:3].tolist(),
                   'depth_range': [float(depth.min()), float(depth.max())],
                   'trajectory': trajectory}
+        result['path_control_config'] = path_cfg
         if report:
             output = Path(report)
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +115,7 @@ if __name__ == '__main__':
     parser.add_argument('--vx', type=float, default=0)
     parser.add_argument('--warmup', type=float, default=2)
     parser.add_argument('--report', type=Path)
+    parser.add_argument('--path-mode', choices=('off', 'constant', 'heading', 'path'), default=None)
     args = parser.parse_args()
-    result = validate(args.seconds, args.vx, args.warmup, args.report)
+    result = validate(args.seconds, args.vx, args.warmup, args.report, args.path_mode)
     raise SystemExit(1 if result['fallen'] or result['off_course'] else 0)

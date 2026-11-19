@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Override config control mode (Parkour defaults to gamepad)")
     parser.add_argument("--gamepad-device", default=None, help="Linux joystick path, e.g. /dev/input/js0")
     parser.add_argument("--gamepad-deadzone", type=float, default=None, help="Stick deadzone in [0, 1)")
+    parser.add_argument('--path-mode', choices=('off', 'constant', 'heading', 'path'), default=None,
+                        help='Override path feedback for baseline comparisons')
+    parser.add_argument('--path-reference', choices=('current', 'fixed', 'startup'), default=None,
+                        help='Current heading per straight segment, fixed centreline, or startup pose')
     parser.add_argument("--device", type=str, default="cpu", help="TorchScript device when exported/policy.pt is used")
     return parser
 

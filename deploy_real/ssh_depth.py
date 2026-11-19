@@ -60,6 +60,9 @@ class RemoteCameraStartupError(ConnectionError):
         if kind == 'device_busy':
             message = ('SSH 已连通，但远端 RealSense 相机被占用。请确认并正常停止占用相机的进程，'
                        '再重试；无需重装 SSH 密钥。本程序不会停止相机占用者。远端原始错误：' + remote_error)
+        elif kind == 'unsupported_profile':
+            message = ('SSH 已连通，但相机当前 USB 连接不支持配置的深度分辨率/帧率。'
+                       '请核对机载相机 USB 线、端口及实际支持模式。详情：' + remote_error)
         else:
             message = 'SSH 远端命令已执行，但相机初始化失败。远端原始错误：' + remote_error
         super().__init__(message)

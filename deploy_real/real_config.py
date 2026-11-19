@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 import yaml
+from common.path_controller import PathSettings
+from deploy_real.tracking_guard import tracking_recovery_config
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / 'deploy_real/config/g1_23dof.yaml'
@@ -15,7 +17,7 @@ def load_config(path=DEFAULT_CONFIG):
         raise ValueError('Expected real deployment configuration')
     control = cfg['control']
     defaults = dict(ready_joint_tolerance_rad=.25, ready_max_joint_velocity_rad_s=.2,
-                    ready_max_gyro_rad_s=.2, ready_hold_s=.5, ready_timeout_s=3.)
+                    ready_max_gyro_rad_s=.2, ready_hold_s=.5, ready_timeout_s=8.)
     for key,value in defaults.items(): control.setdefault(key,value)
     positive = ('motor_dt', 'state_timeout_s', 'depth_timeout_s', 'action_timeout_s',
                 'startup_timeout_s', 'ramp_s', *defaults, 'policy_blend_s', 'damping_kd', 'damping_duration_s',
@@ -38,4 +40,14 @@ def load_config(path=DEFAULT_CONFIG):
         raise ValueError('max_tilt_rad must be less than pi/2')
     if not 0 < cfg['camera']['stream_timeout_s'] <= control['depth_timeout_s']:
         raise ValueError('Camera timeout must not exceed depth watchdog')
+    control['tracking_recovery'] = tracking_recovery_config(control)
+    path = cfg.get('path_control') or {}
+    settings = PathSettings.from_dict(path)
+    if settings.enabled:
+        if (settings.max_forward_m_s > control['max_forward_m_s'] or
+                settings.max_yaw_rad_s > control['max_yaw_rad_s']):
+            raise ValueError('Path limits must not exceed real control velocity limits')
+        source = path.get('pose_source') or {}
+        if settings.mode == 'path' and (source.get('type') != 'json_file' or not source.get('path')):
+            raise ValueError('Path control requires an external localization source')
     return cfg
